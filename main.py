@@ -616,13 +616,8 @@ class GoogleSheetsClient(SheetClient):
         self.signals_tab = signals_tab
         self.champion_tab = champion_tab
 
-    
     def _with_retry(self, fn, *, what: str, max_tries: int = 6):
-        """
-        Retry wrapper mainly for Google Sheets 429 quota errors.
-        Exponential backoff: 1,2,4,8,16... seconds (capped).
-        """
-        import gspread
+        """Retry wrapper mainly for Google Sheets 429 quota errors."""
         from gspread.exceptions import APIError
 
         delay = 1.0
@@ -637,12 +632,9 @@ class GoogleSheetsClient(SheetClient):
                     delay = min(delay * 2.0, 30.0)
                     continue
                 raise
-            except Exception:
-                # Don't hide other errors; just re-raise
-                raise
         raise RuntimeError(f"Exceeded retry budget for {what}")
 
-def _ws(self, name: str, rows: int = 1000, cols: int = 40):
+    def _ws(self, name: str, rows: int = 1000, cols: int = 40):
         import gspread
 
         try:
