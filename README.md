@@ -52,3 +52,8 @@ python main.py --once
 - **Evolution** selects by Validation fitness.
 - **Champion** is updated ONLY by **Test fitness**, and is the all-time "high score" stored in state + written to the `champion` tab.
 - Every cycle, every genome gets a shot at champion: the best TEST performer in the current population is compared against the all-time champion.
+
+
+## v2.1 patch notes
+- Fix: avoid `ValueError: assignment destination is read-only` by copying numpy arrays before in-place masking.
+- Add: retry/backoff on Google Sheets 429 quota errors.

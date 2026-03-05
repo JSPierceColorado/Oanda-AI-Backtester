@@ -121,6 +121,7 @@ def eval_num(node: Dict[str, Any], df: pd.DataFrame) -> np.ndarray:
         name = node.get("name", "")
         if name in df.columns:
             arr = pd.to_numeric(df[name], errors="coerce").to_numpy(dtype=float)
+            arr = np.array(arr, dtype=float, copy=True)
             arr[~np.isfinite(arr)] = np.nan
             return arr
         return _nan_array(n)
@@ -177,6 +178,7 @@ def eval_num(node: Dict[str, Any], df: pd.DataFrame) -> np.ndarray:
         x = eval_num(node.get("x", {"t": "const", "v": 1.0}), df)
         y = eval_num(node.get("y", {"t": "const", "v": -1.0}), df)
         out = np.where(cond, x, y)
+        out = np.array(out, dtype=float, copy=True)
         out[~np.isfinite(out)] = np.nan
         return out
 
@@ -614,7 +616,33 @@ class GoogleSheetsClient(SheetClient):
         self.signals_tab = signals_tab
         self.champion_tab = champion_tab
 
-    def _ws(self, name: str, rows: int = 1000, cols: int = 40):
+    
+    def _with_retry(self, fn, *, what: str, max_tries: int = 6):
+        """
+        Retry wrapper mainly for Google Sheets 429 quota errors.
+        Exponential backoff: 1,2,4,8,16... seconds (capped).
+        """
+        import gspread
+        from gspread.exceptions import APIError
+
+        delay = 1.0
+        for attempt in range(1, max_tries + 1):
+            try:
+                return fn()
+            except APIError as e:
+                msg = str(e)
+                if "429" in msg or "Quota exceeded" in msg:
+                    log.warning("Sheets quota hit during %s (attempt %s/%s). Sleeping %.1fs", what, attempt, max_tries, delay)
+                    time.sleep(delay)
+                    delay = min(delay * 2.0, 30.0)
+                    continue
+                raise
+            except Exception:
+                # Don't hide other errors; just re-raise
+                raise
+        raise RuntimeError(f"Exceeded retry budget for {what}")
+
+def _ws(self, name: str, rows: int = 1000, cols: int = 40):
         import gspread
 
         try:
@@ -624,7 +652,7 @@ class GoogleSheetsClient(SheetClient):
 
     def read_screener(self) -> pd.DataFrame:
         ws = self._ws(self.screener_tab, rows=2000, cols=200)
-        values = ws.get_all_values()
+        values = self._with_retry(lambda: ws.get_all_values(), what=f"read {ws.title}")
         if not values:
             return pd.DataFrame()
         header = values[0]
@@ -633,7 +661,7 @@ class GoogleSheetsClient(SheetClient):
 
     def read_history(self, lookback_rows: int) -> pd.DataFrame:
         ws = self._ws(self.history_tab, rows=50000, cols=200)
-        values = ws.get_all_values()
+        values = self._with_retry(lambda: ws.get_all_values(), what=f"read {ws.title}")
         if not values:
             return pd.DataFrame()
 
@@ -656,32 +684,32 @@ class GoogleSheetsClient(SheetClient):
         return pd.DataFrame(data_rows, columns=header)
 
     def _ensure_header_row(self, ws, header: List[str]) -> None:
-        values = ws.get_all_values()
+        values = self._with_retry(lambda: ws.get_all_values(), what=f"read {ws.title}")
         if not values:
-            ws.append_row(header, value_input_option="RAW")
+            self._with_retry(lambda: ws.append_row(header, value_input_option="RAW"), what=f"append_row {ws.title}")
             return
         # If first row isn't our header, prepend it (common when sheet existed but was blank/formatted)
         first = values[0]
         if len(first) < len(header) or any(str(first[i]).strip() != header[i] for i in range(min(len(first), len(header)))):
-            ws.insert_row(header, 1, value_input_option="RAW")
+            self._with_retry(lambda: ws.insert_row(header, 1, value_input_option="RAW"), what=f"insert_row {ws.title}")
 
     def append_strategies(self, header: List[str], rows: List[List[Any]]) -> None:
         ws = self._ws(self.strategies_tab, rows=20000, cols=max(40, len(header) + 2))
         self._ensure_header_row(ws, header)
-        ws.append_rows(rows, value_input_option="RAW")
+        self._with_retry(lambda: ws.append_rows(rows, value_input_option="RAW"), what=f"append_rows {ws.title}")
 
     def write_champion(self, header: List[str], row: List[Any]) -> None:
         ws = self._ws(self.champion_tab, rows=2000, cols=max(40, len(header) + 2))
-        ws.clear()
-        ws.append_row(header, value_input_option="RAW")
-        ws.append_row(row, value_input_option="RAW")
+        self._with_retry(lambda: ws.clear(), what=f"clear {ws.title}")
+        self._with_retry(lambda: ws.append_row(header, value_input_option="RAW"), what=f"append_row {ws.title}")
+        self._with_retry(lambda: ws.append_row(row, value_input_option="RAW"), what=f"append_row {ws.title}")
 
     def replace_signals(self, header: List[str], rows: List[List[Any]]) -> None:
         ws = self._ws(self.signals_tab, rows=2000, cols=max(40, len(header) + 2))
-        ws.clear()
-        ws.append_row(header, value_input_option="RAW")
+        self._with_retry(lambda: ws.clear(), what=f"clear {ws.title}")
+        self._with_retry(lambda: ws.append_row(header, value_input_option="RAW"), what=f"append_row {ws.title}")
         if rows:
-            ws.append_rows(rows, value_input_option="RAW")
+            self._with_retry(lambda: ws.append_rows(rows, value_input_option="RAW"), what=f"append_rows {ws.title}")
 
 
 # ============================================================
@@ -781,6 +809,7 @@ def make_signals_for_frame(d: pd.DataFrame, g: Genome, rng_seed: int) -> pd.Seri
 
     # score-based
     score = eval_num(g.score_expr, d)
+    score = np.array(score, dtype=float, copy=True)
     score[~np.isfinite(score)] = np.nan
 
     if g.select_mode == "threshold":
