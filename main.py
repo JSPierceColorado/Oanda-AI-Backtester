@@ -77,7 +77,7 @@ def clamp(v: float, lo: float, hi: float) -> float:
 
 
 def now_utc_iso() -> str:
-    return pd.Timestamp.utcnow().isoformat()
+    return pd.Timestamp.now('UTC').isoformat()
 
 
 def max_drawdown(rets: np.ndarray) -> float:
@@ -124,7 +124,7 @@ def _safe_div(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def _safe_pow(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    with np.errstate(over="ignore", invalid="ignore"):
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
         out = np.power(a, b)
     out[~np.isfinite(out)] = np.nan
     return out
@@ -861,7 +861,10 @@ class SheetClient:
     def read_history(self, lookback_rows: int) -> pd.DataFrame:
         raise NotImplementedError
 
-    def append_strategies(self, header: List[str], rows: List[List[Any]]) -> None:
+    def read_strategies(self) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def replace_strategies(self, header: List[str], rows: List[List[Any]]) -> None:
         raise NotImplementedError
 
     def write_champion(self, header: List[str], row: List[Any]) -> None:
@@ -887,7 +890,10 @@ class ExcelClient(SheetClient):
         hist_raw.columns = list(scr.columns)
         return hist_raw
 
-    def append_strategies(self, header: List[str], rows: List[List[Any]]) -> None:
+    def read_strategies(self) -> pd.DataFrame:
+        return pd.DataFrame()
+
+    def replace_strategies(self, header: List[str], rows: List[List[Any]]) -> None:
         log.info("STRATEGIES_HEADER %s", header)
         for r in rows:
             log.info("STRATEGY_ROW %s", r)
@@ -1007,10 +1013,25 @@ class GoogleSheetsClient(SheetClient):
         if len(first) < len(header) or any(str(first[i]).strip() != header[i] for i in range(min(len(first), len(header)))):
             self._with_retry(lambda: ws.insert_row(header, 1, value_input_option="RAW"), what=f"insert_row {ws.title}")
 
-    def append_strategies(self, header: List[str], rows: List[List[Any]]) -> None:
-        ws = self._ws(self.strategies_tab, rows=20000, cols=max(60, len(header) + 2))
-        self._ensure_header_row(ws, header)
-        self._with_retry(lambda: ws.append_rows(rows, value_input_option="RAW"), what=f"append_rows {ws.title}")
+    def read_strategies(self) -> pd.DataFrame:
+        ws = self._ws(self.strategies_tab, rows=5000, cols=200)
+        values = self._with_retry(lambda: ws.get_all_values(), what=f"read {ws.title}")
+        if not values:
+            return pd.DataFrame()
+        header = values[0]
+        if not header or "genome_id" not in [str(x).strip() for x in header]:
+            return pd.DataFrame()
+        rows = values[1:]
+        if not rows:
+            return pd.DataFrame(columns=header)
+        return pd.DataFrame(rows, columns=header)
+
+    def replace_strategies(self, header: List[str], rows: List[List[Any]]) -> None:
+        ws = self._ws(self.strategies_tab, rows=max(2000, len(rows) + 50), cols=max(60, len(header) + 2))
+        self._with_retry(lambda: ws.clear(), what=f"clear {ws.title}")
+        self._with_retry(lambda: ws.append_row(header, value_input_option="RAW"), what=f"append_row {ws.title}")
+        if rows:
+            self._with_retry(lambda: ws.append_rows(rows, value_input_option="RAW"), what=f"append_rows {ws.title}")
 
     def write_champion(self, header: List[str], row: List[Any]) -> None:
         ws = self._ws(self.champion_tab, rows=2000, cols=max(60, len(header) + 2))
@@ -1719,6 +1740,7 @@ class Config:
     champion_max_test_mdd: float
     allowed_live_tiers: List[str]
     signal_require_eligible: bool
+    max_strategy_rows: int
 
 
 def load_config() -> Config:
@@ -1767,6 +1789,7 @@ def load_config() -> Config:
         champion_max_test_mdd=env_float("CHAMPION_MAX_TEST_MDD", 0.25),
         allowed_live_tiers=allowed_live_tiers,
         signal_require_eligible=env_bool("SIGNAL_REQUIRE_ELIGIBLE", True),
+        max_strategy_rows=env_int("MAX_STRATEGY_ROWS", 200),
     )
 
 
@@ -1799,30 +1822,189 @@ def extract_feature_cols(df: pd.DataFrame) -> List[str]:
     return cols
 
 
-def genome_to_summary_row(
-    g: Genome,
-    res: Dict[str, Any],
-) -> List[Any]:
-    return [
-        genome_id(g),
-        g.family,
-        g.complexity_tier,
-        g.side_mode,
-        genome_complexity(g),
-        float(res["val_selection_fitness"]),
-        float(res["val"]["fitness_hard"]),
-        int(res["val"]["trade_n"]),
-        float(res["val"]["total"]),
-        float(res["val"]["sharpe"]),
-        float(res["val"]["mdd"]),
-        int(res["test"]["trade_n"]),
-        float(res["test"]["total"]),
-        float(res["test"]["sharpe"]),
-        float(res["test"]["mdd"]),
-        bool(res["champion_eligible"]),
-        res["champion_eligible_reasons"],
-        genome_expr_str(g),
-    ]
+STRATEGY_BOARD_HEADER = [
+    "genome_id",
+    "first_seen_utc",
+    "last_seen_utc",
+    "last_cycle_seen",
+    "times_seen",
+    "family",
+    "complexity_tier",
+    "side_mode",
+    "complexity_score",
+    "champion_eligible",
+    "champion_eligible_reasons",
+    "val_selection_fitness",
+    "val_fitness_hard",
+    "val_bars",
+    "val_trade_n",
+    "val_total",
+    "val_sharpe",
+    "val_mdd",
+    "test_selection_fitness",
+    "test_fitness_hard",
+    "test_bars",
+    "test_trade_n",
+    "test_total",
+    "test_sharpe",
+    "test_mdd",
+    "select_mode",
+    "thr",
+    "top_k",
+    "horizon",
+    "cost_mult",
+    "random_trade_prob",
+    "filters_count",
+    "score_expr",
+    "params_json",
+]
+
+
+def strategy_board_row(g: Genome, res: Dict[str, Any], ts_utc: str, cycle: int) -> Dict[str, Any]:
+    return {
+        "genome_id": genome_id(g),
+        "first_seen_utc": ts_utc,
+        "last_seen_utc": ts_utc,
+        "last_cycle_seen": int(cycle),
+        "times_seen": 1,
+        "family": g.family,
+        "complexity_tier": g.complexity_tier,
+        "side_mode": g.side_mode,
+        "complexity_score": genome_complexity(g),
+        "champion_eligible": bool(res["champion_eligible"]),
+        "champion_eligible_reasons": res["champion_eligible_reasons"],
+        "val_selection_fitness": float(res["val_selection_fitness"]),
+        "val_fitness_hard": float(res["val"]["fitness_hard"]),
+        "val_bars": int(res["val"]["n"]),
+        "val_trade_n": int(res["val"].get("trade_n", 0)),
+        "val_total": float(res["val"]["total"]),
+        "val_sharpe": float(res["val"]["sharpe"]),
+        "val_mdd": float(res["val"]["mdd"]),
+        "test_selection_fitness": float(res["test_selection_fitness"]),
+        "test_fitness_hard": float(res["test"]["fitness_hard"]),
+        "test_bars": int(res["test"]["n"]),
+        "test_trade_n": int(res["test"].get("trade_n", 0)),
+        "test_total": float(res["test"]["total"]),
+        "test_sharpe": float(res["test"]["sharpe"]),
+        "test_mdd": float(res["test"]["mdd"]),
+        "select_mode": g.select_mode,
+        "thr": float(g.thr),
+        "top_k": int(g.top_k),
+        "horizon": int(g.horizon),
+        "cost_mult": float(g.cost_mult),
+        "random_trade_prob": float(g.random_trade_prob),
+        "filters_count": int(len(g.filters)),
+        "score_expr": genome_expr_str(g),
+        "params_json": json.dumps(asdict(g), sort_keys=True),
+    }
+
+
+def _coerce_board_numeric(df: pd.DataFrame, cols: List[str], as_int: bool = False) -> None:
+    for c in cols:
+        if c not in df.columns:
+            continue
+        vals = pd.to_numeric(df[c], errors="coerce")
+        if as_int:
+            df[c] = vals.fillna(0).astype(int)
+        else:
+            df[c] = vals.fillna(0.0).astype(float)
+
+
+def normalize_strategy_board(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=STRATEGY_BOARD_HEADER)
+
+    d = df.copy()
+    for c in STRATEGY_BOARD_HEADER:
+        if c not in d.columns:
+            d[c] = ""
+
+    d = d[STRATEGY_BOARD_HEADER].copy()
+    d["genome_id"] = d["genome_id"].astype(str).str.strip()
+    d = d[d["genome_id"] != ""].copy()
+
+    _coerce_board_numeric(d, ["last_cycle_seen", "times_seen", "complexity_score", "val_bars", "val_trade_n", "test_bars", "test_trade_n", "top_k", "horizon", "filters_count"], as_int=True)
+    _coerce_board_numeric(d, ["val_selection_fitness", "val_fitness_hard", "val_total", "val_sharpe", "val_mdd", "test_selection_fitness", "test_fitness_hard", "test_total", "test_sharpe", "test_mdd", "thr", "cost_mult", "random_trade_prob"], as_int=False)
+
+    d["champion_eligible"] = d["champion_eligible"].map(to_bool).fillna(False).astype(bool)
+    d["first_seen_utc"] = d["first_seen_utc"].astype(str)
+    d["last_seen_utc"] = d["last_seen_utc"].astype(str)
+    d["champion_eligible_reasons"] = d["champion_eligible_reasons"].astype(str)
+    d["family"] = d["family"].astype(str)
+    d["complexity_tier"] = d["complexity_tier"].astype(str)
+    d["side_mode"] = d["side_mode"].astype(str)
+    d["select_mode"] = d["select_mode"].astype(str)
+    d["score_expr"] = d["score_expr"].astype(str)
+    d["params_json"] = d["params_json"].astype(str)
+    return d
+
+
+def strategy_survival_sort(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    d = df.copy()
+    d["champion_eligible_rank"] = d["champion_eligible"].astype(int)
+    return d.sort_values(
+        by=[
+            "champion_eligible_rank",
+            "val_selection_fitness",
+            "test_selection_fitness",
+            "test_total",
+            "val_total",
+            "times_seen",
+            "complexity_score",
+            "last_seen_utc",
+        ],
+        ascending=[False, False, False, False, False, False, True, False],
+        kind="mergesort",
+    )
+
+
+def merge_strategy_board(existing_df: pd.DataFrame, current_rows: List[Dict[str, Any]], max_rows: int) -> pd.DataFrame:
+    existing = normalize_strategy_board(existing_df)
+    current = normalize_strategy_board(pd.DataFrame(current_rows, columns=STRATEGY_BOARD_HEADER))
+
+    if current.empty and existing.empty:
+        return pd.DataFrame(columns=STRATEGY_BOARD_HEADER)
+
+    if not existing.empty:
+        existing = strategy_survival_sort(existing).drop_duplicates(subset=["genome_id"], keep="first")
+    if not current.empty:
+        current = strategy_survival_sort(current).drop_duplicates(subset=["genome_id"], keep="first")
+
+    if existing.empty:
+        merged = current
+    elif current.empty:
+        merged = existing
+    else:
+        current_ids = set(current["genome_id"].astype(str))
+        survivors = existing[~existing["genome_id"].astype(str).isin(current_ids)].copy()
+        merged = pd.concat([survivors, current], ignore_index=True)
+
+    if not existing.empty and not current.empty:
+        seen_before = existing.set_index("genome_id")
+        for idx, gid in current["genome_id"].items():
+            if gid in seen_before.index:
+                merged_idx = merged.index[merged["genome_id"] == gid]
+                if len(merged_idx) == 0:
+                    continue
+                mi = merged_idx[0]
+                prev = seen_before.loc[gid]
+                merged.at[mi, "first_seen_utc"] = prev.get("first_seen_utc", merged.at[mi, "first_seen_utc"])
+                merged.at[mi, "times_seen"] = int(pd.to_numeric(prev.get("times_seen", 0), errors="coerce") or 0) + 1
+            else:
+                merged_idx = merged.index[merged["genome_id"] == gid]
+                if len(merged_idx) > 0:
+                    mi = merged_idx[0]
+                    merged.at[mi, "times_seen"] = max(1, int(pd.to_numeric(merged.at[mi, "times_seen"], errors="coerce") or 1))
+
+    merged = normalize_strategy_board(merged)
+    merged = strategy_survival_sort(merged).drop_duplicates(subset=["genome_id"], keep="first")
+    merged = merged.head(max_rows).copy()
+    if "champion_eligible_rank" in merged.columns:
+        merged = merged.drop(columns=["champion_eligible_rank"])
+    return merged[STRATEGY_BOARD_HEADER]
 
 
 def main() -> None:
@@ -1874,60 +2056,7 @@ def main() -> None:
             champ = None
             champ_score = -1e18
 
-    strategies_header = [
-        "ts_utc",
-        "cycle",
-        "best_val_strategy_id",
-        "best_val_family",
-        "best_val_tier",
-        "best_val_side_mode",
-        "best_val_complexity",
-        "best_val_selection_fitness",
-        "best_val_val_fitness_hard",
-        "best_val_val_trades",
-        "best_val_val_total",
-        "best_val_val_sharpe",
-        "best_val_val_mdd",
-        "best_val_test_trades",
-        "best_val_test_total",
-        "best_val_test_sharpe",
-        "best_val_test_mdd",
-        "best_val_eligible",
-        "best_val_eligible_reasons",
-        "best_val_expr",
-        "best_test_strategy_id",
-        "best_test_family",
-        "best_test_tier",
-        "best_test_side_mode",
-        "best_test_complexity",
-        "best_test_selection_fitness",
-        "best_test_test_fitness_hard",
-        "best_test_val_trades",
-        "best_test_val_total",
-        "best_test_test_trades",
-        "best_test_test_total",
-        "best_test_test_sharpe",
-        "best_test_test_mdd",
-        "best_test_eligible",
-        "best_test_eligible_reasons",
-        "best_test_expr",
-        "champion_strategy_id",
-        "champion_family",
-        "champion_tier",
-        "champion_side_mode",
-        "champion_complexity",
-        "champion_selection_fitness",
-        "champion_val_trades",
-        "champion_val_total",
-        "champion_test_trades",
-        "champion_test_total",
-        "champion_test_sharpe",
-        "champion_test_mdd",
-        "champion_eligible",
-        "champion_eligible_reasons",
-        "champion_expr",
-        "params_json",
-    ]
+    strategies_header = STRATEGY_BOARD_HEADER
 
     champion_header = [
         "ts_utc",
@@ -2019,60 +2148,14 @@ def main() -> None:
 
         cycle_ts = now_utc_iso()
 
-        params_json = json.dumps(
-            {
-                "best_val": asdict(best_val_g),
-                "best_test": asdict(best_test_g),
-                "champion": asdict(champ) if champ else None,
-                "config": {
-                    "split_mode": cfg.split_mode,
-                    "walk_forward_splits": cfg.walk_forward_splits,
-                    "allowed_live_tiers": cfg.allowed_live_tiers,
-                },
-            },
-            sort_keys=True,
-        )
+        current_board_rows = [strategy_board_row(g, res, cycle_ts, cycle) for g, res in scored]
+        if champ and champ_res and genome_id(champ) not in {row["genome_id"] for row in current_board_rows}:
+            current_board_rows.append(strategy_board_row(champ, champ_res, cycle_ts, cycle))
 
-        best_val_vals = genome_to_summary_row(best_val_g, best_val_res)
-
-        row = [
-            cycle_ts,
-            cycle,
-            *best_val_vals,
-            genome_id(best_test_g),
-            best_test_g.family,
-            best_test_g.complexity_tier,
-            best_test_g.side_mode,
-            genome_complexity(best_test_g),
-            float(best_test_res["test_selection_fitness"]),
-            float(best_test_res["test"]["fitness_hard"]),
-            int(best_test_res["val"]["trade_n"]),
-            float(best_test_res["val"]["total"]),
-            int(best_test_res["test"]["trade_n"]),
-            float(best_test_res["test"]["total"]),
-            float(best_test_res["test"]["sharpe"]),
-            float(best_test_res["test"]["mdd"]),
-            bool(best_test_res["champion_eligible"]),
-            best_test_res["champion_eligible_reasons"],
-            genome_expr_str(best_test_g),
-            champ_id,
-            champ.family if champ else "",
-            champ.complexity_tier if champ else "",
-            champ.side_mode if champ else "",
-            genome_complexity(champ) if champ else "",
-            float(champ_res["val_selection_fitness"]) if champ_res else "",
-            int(champ_res["val"]["trade_n"]) if champ_res else "",
-            float(champ_res["val"]["total"]) if champ_res else "",
-            int(champ_res["test"]["trade_n"]) if champ_res else "",
-            float(champ_res["test"]["total"]) if champ_res else "",
-            float(champ_res["test"]["sharpe"]) if champ_res else "",
-            float(champ_res["test"]["mdd"]) if champ_res else "",
-            bool(champ_res["champion_eligible"]) if champ_res else "",
-            champ_res["champion_eligible_reasons"] if champ_res else "",
-            champ_expr,
-            params_json,
-        ]
-        client.append_strategies(strategies_header, [row])
+        existing_board = client.read_strategies()
+        merged_board = merge_strategy_board(existing_board, current_board_rows, cfg.max_strategy_rows)
+        board_rows = merged_board[STRATEGY_BOARD_HEADER].values.tolist() if not merged_board.empty else []
+        client.replace_strategies(strategies_header, board_rows)
 
         if improved and champ and champ_res:
             champ_row = [
