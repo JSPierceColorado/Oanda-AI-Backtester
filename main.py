@@ -1,3 +1,4 @@
+
 import os
 import json
 import time
@@ -585,12 +586,7 @@ def template_to_str(template: Optional[Dict[str, Any]]) -> str:
 
 def random_template(rng: random.Random, cols: List[str], tier: str) -> Dict[str, Any]:
     cols = cols or ["close"]
-    if tier == "simple":
-        kinds = ["feature_rank", "feature_spread", "feature_threshold"]
-    elif tier == "medium":
-        kinds = ["feature_rank", "feature_spread", "feature_threshold"]
-    else:
-        kinds = ["feature_rank", "feature_spread", "feature_threshold"]
+    kinds = ["feature_rank", "feature_spread", "feature_threshold"]
 
     kind = rng.choice(kinds)
     if kind == "feature_rank":
@@ -690,7 +686,7 @@ class Genome:
         self.select_mode = self.select_mode if self.select_mode in ("threshold", "topk", "random") else "threshold"
         self.side_mode = self.side_mode if self.side_mode in ("both", "long_only", "short_only") else "both"
         self.thr = clamp(float(self.thr), 0.0, 100.0)
-        self.top_k = int(clamp(int(self.top_k), 1, 200))
+        self.top_k = int(clamp(int(self.top_k), 1, 6))
         self.horizon = int(clamp(int(self.horizon), 1, 200))
         self.cost_mult = clamp(float(self.cost_mult), 0.0, 50.0)
         self.random_trade_prob = clamp(float(self.random_trade_prob), 0.0, 1.0)
@@ -716,7 +712,7 @@ def genome_complexity(g: Genome) -> int:
         total += expr_node_count(f)
     total += len(g.filters) * 3
     if g.family == "template":
-        total = min(total, max(3, total))
+        total = max(3, total)
     return total
 
 
@@ -742,7 +738,7 @@ def random_genome(rng: random.Random, cols: List[str], tier: str, max_expr_depth
     family = rng.choices(["template", "expr"], weights=[template_w, expr_w], k=1)[0]
 
     select_mode = random_select_mode(rng, tier)
-    side_mode = rng.choice(["both", "long_only", "short_only"] if tier != "simple" else ["both", "long_only", "short_only"])
+    side_mode = rng.choice(["both", "long_only", "short_only"])
 
     if family == "template":
         template = random_template(rng, cols, tier)
@@ -757,14 +753,14 @@ def random_genome(rng: random.Random, cols: List[str], tier: str, max_expr_depth
         else:
             thr = 0.0
 
-        top_k_choices = [1, 2, 3, 5] if tier == "simple" else [1, 2, 3, 5, 8]
+        top_k_choices = [1, 2, 3, 5, 6]
         top_k = rng.choice(top_k_choices)
     else:
         depth = rng.randint(1, max_num_depth_for_tier(tier, max_expr_depth))
         score_expr = random_num_expr(rng, cols, depth=depth, tier=tier)
         template = None
         thr = abs(random_const(rng))
-        top_k = rng.choice([1, 2, 3, 5, 8, 13] if tier != "simple" else [1, 2, 3, 5])
+        top_k = rng.choice([1, 2, 3, 5, 6])
 
     g = Genome(
         family=family,
@@ -828,7 +824,8 @@ def mutate(g: Genome, rng: random.Random, cols: List[str], max_expr_depth: int) 
     if rng.random() < 0.45:
         h.thr = abs(h.thr + rng.gauss(0, 0.35 if tier == "simple" else 0.75))
     if rng.random() < 0.30:
-        h.top_k = int(clamp(h.top_k + rng.choice([-3, -1, 1, 3] if tier == "simple" else [-5, -3, -1, 1, 3, 5]), 1, 200))
+        step_choices = [-3, -1, 1, 3] if tier == "simple" else [-5, -3, -1, 1, 3, 5]
+        h.top_k = int(clamp(h.top_k + rng.choice(step_choices), 1, 6))
     if rng.random() < 0.12:
         h.side_mode = rng.choice(["both", "long_only", "short_only"])
     if rng.random() < 0.35:
@@ -1233,6 +1230,8 @@ def score_rets(rets: np.ndarray, min_trades: int) -> Dict[str, Any]:
     if n == 0:
         return {
             "n": 0,
+            "bar_n": 0,
+            "trade_n": 0,
             "fitness": -1e12,
             "fitness_soft": -1e12,
             "fitness_hard": -1e12,
@@ -1258,6 +1257,8 @@ def score_rets(rets: np.ndarray, min_trades: int) -> Dict[str, Any]:
 
     return {
         "n": n,
+        "bar_n": n,
+        "trade_n": n,
         "fitness": float(fitness_soft),
         "fitness_soft": float(fitness_soft),
         "fitness_hard": float(fitness_hard),
@@ -1266,7 +1267,7 @@ def score_rets(rets: np.ndarray, min_trades: int) -> Dict[str, Any]:
         "sharpe": float(sharpe),
         "mdd": float(mdd),
         "mean": mean,
-        "std": std,
+        "std": float(std),
         "trade_scale": float(trade_scale),
     }
 
@@ -1319,10 +1320,26 @@ def walk_forward_splits(df: pd.DataFrame, train_frac: float, val_frac: float, n_
     return splits or [split_by_time(df, train_frac, val_frac)]
 
 
-def concat_trade_returns(frames: List[pd.DataFrame]) -> np.ndarray:
+def concat_bar_returns(frames: List[pd.DataFrame]) -> np.ndarray:
+    """
+    Convert trade-level returns into one equal-weight portfolio return per timestamp.
+    This avoids scoring multiple trades from the same bar as independent observations.
+    """
     if not frames:
         return np.array([], dtype=float)
-    parts = [f["ret"].to_numpy(dtype=float) for f in frames if f is not None and not f.empty]
+
+    parts: List[np.ndarray] = []
+    for f in frames:
+        if f is None or f.empty:
+            continue
+        bars = (
+            f.groupby("asof_utc", sort=True)["ret"]
+            .mean()
+            .to_numpy(dtype=float)
+        )
+        if len(bars):
+            parts.append(bars)
+
     if not parts:
         return np.array([], dtype=float)
     return np.concatenate(parts)
@@ -1356,11 +1373,14 @@ def eval_genome(
         if not tr_test.empty:
             test_frames.append(tr_test)
 
-    val_rets = concat_trade_returns(val_frames)
-    test_rets = concat_trade_returns(test_frames)
+    val_rets = concat_bar_returns(val_frames)
+    test_rets = concat_bar_returns(test_frames)
 
     val_score = score_rets(val_rets, min_trades=cfg.min_trades)
     test_score = score_rets(test_rets, min_trades=cfg.min_trades)
+
+    val_score["trade_n"] = int(sum(len(f) for f in val_frames if f is not None))
+    test_score["trade_n"] = int(sum(len(f) for f in test_frames if f is not None))
 
     complexity = genome_complexity(g)
     complexity_penalty = cfg.complexity_penalty * complexity
@@ -1370,10 +1390,10 @@ def eval_genome(
     test_selection_fitness = test_score["fitness_soft"] - complexity_penalty - consistency_penalty
 
     reasons: List[str] = []
-    if val_score["n"] < cfg.champion_min_val_trades:
-        reasons.append(f"val_trades<{cfg.champion_min_val_trades}")
-    if test_score["n"] < cfg.champion_min_test_trades:
-        reasons.append(f"test_trades<{cfg.champion_min_test_trades}")
+    if val_score["bar_n"] < cfg.champion_min_val_trades:
+        reasons.append(f"val_bars<{cfg.champion_min_val_trades}")
+    if test_score["bar_n"] < cfg.champion_min_test_trades:
+        reasons.append(f"test_bars<{cfg.champion_min_test_trades}")
     if cfg.champion_require_positive_val_total and val_score["total"] <= 0:
         reasons.append("val_total<=0")
     if cfg.champion_require_positive_test_total and test_score["total"] <= 0:
@@ -1420,7 +1440,21 @@ def tier_target_counts(cfg: "Config") -> Dict[str, int]:
     return {"simple": simple_n, "medium": medium_n, "complex": complex_n}
 
 
+def dedupe_population(pop: List[Genome]) -> List[Genome]:
+    out: List[Genome] = []
+    seen = set()
+    for g in pop:
+        gid = genome_id(g)
+        if gid in seen:
+            continue
+        seen.add(gid)
+        out.append(g)
+    return out
+
+
 def rebalance_population(pop: List[Genome], rng: random.Random, cols: List[str], cfg: "Config") -> List[Genome]:
+    pop = dedupe_population(pop)
+
     targets = tier_target_counts(cfg)
     buckets: Dict[str, List[Genome]] = {tier: [] for tier in VALID_TIERS}
     leftovers: List[Genome] = []
@@ -1500,13 +1534,14 @@ def evolve_one_cycle(
 
             next_pop.extend(bucket_next)
 
+        next_pop = dedupe_population(next_pop)
+        while len(next_pop) < cfg.pop_size:
+            tier = rng.choice(list(VALID_TIERS))
+            next_pop.append(random_genome(rng, cols, tier, cfg.max_expr_depth))
+
         pop = rebalance_population(next_pop, rng, cols, cfg)
 
     return pop
-
-
-def choose_best(scored: List[Tuple[Genome, Dict[str, Any]]], metric: str) -> Tuple[Genome, Dict[str, Any]]:
-    return max(scored, key=lambda x: x[1][metric])
 
 
 def choose_champion_candidate(scored: List[Tuple[Genome, Dict[str, Any]]]) -> Optional[Tuple[Genome, Dict[str, Any]]]:
@@ -1628,7 +1663,9 @@ def load_state(path: str) -> Dict[str, Any]:
 def save_state(path: str, state: Dict[str, Any]) -> None:
     if not path:
         return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, sort_keys=True)
 
@@ -1774,11 +1811,11 @@ def genome_to_summary_row(
         genome_complexity(g),
         float(res["val_selection_fitness"]),
         float(res["val"]["fitness_hard"]),
-        int(res["val"]["n"]),
+        int(res["val"]["trade_n"]),
         float(res["val"]["total"]),
         float(res["val"]["sharpe"]),
         float(res["val"]["mdd"]),
-        int(res["test"]["n"]),
+        int(res["test"]["trade_n"]),
         float(res["test"]["total"]),
         float(res["test"]["sharpe"]),
         float(res["test"]["mdd"]),
@@ -1980,6 +2017,8 @@ def main() -> None:
             state["champion"] = {"genome": asdict(champ), "score": champ_score}
         save_state(cfg.state_path, state)
 
+        cycle_ts = now_utc_iso()
+
         params_json = json.dumps(
             {
                 "best_val": asdict(best_val_g),
@@ -1997,7 +2036,7 @@ def main() -> None:
         best_val_vals = genome_to_summary_row(best_val_g, best_val_res)
 
         row = [
-            now_utc_iso(),
+            cycle_ts,
             cycle,
             *best_val_vals,
             genome_id(best_test_g),
@@ -2007,9 +2046,9 @@ def main() -> None:
             genome_complexity(best_test_g),
             float(best_test_res["test_selection_fitness"]),
             float(best_test_res["test"]["fitness_hard"]),
-            int(best_test_res["val"]["n"]),
+            int(best_test_res["val"]["trade_n"]),
             float(best_test_res["val"]["total"]),
-            int(best_test_res["test"]["n"]),
+            int(best_test_res["test"]["trade_n"]),
             float(best_test_res["test"]["total"]),
             float(best_test_res["test"]["sharpe"]),
             float(best_test_res["test"]["mdd"]),
@@ -2022,9 +2061,9 @@ def main() -> None:
             champ.side_mode if champ else "",
             genome_complexity(champ) if champ else "",
             float(champ_res["val_selection_fitness"]) if champ_res else "",
-            int(champ_res["val"]["n"]) if champ_res else "",
+            int(champ_res["val"]["trade_n"]) if champ_res else "",
             float(champ_res["val"]["total"]) if champ_res else "",
-            int(champ_res["test"]["n"]) if champ_res else "",
+            int(champ_res["test"]["trade_n"]) if champ_res else "",
             float(champ_res["test"]["total"]) if champ_res else "",
             float(champ_res["test"]["sharpe"]) if champ_res else "",
             float(champ_res["test"]["mdd"]) if champ_res else "",
@@ -2037,7 +2076,7 @@ def main() -> None:
 
         if improved and champ and champ_res:
             champ_row = [
-                now_utc_iso(),
+                cycle_ts,
                 champ_id,
                 champ.family,
                 champ.complexity_tier,
@@ -2045,12 +2084,12 @@ def main() -> None:
                 genome_complexity(champ),
                 float(champ_res["val_selection_fitness"]),
                 float(champ_res["val"]["fitness_hard"]),
-                int(champ_res["val"]["n"]),
+                int(champ_res["val"]["trade_n"]),
                 float(champ_res["val"]["total"]),
                 float(champ_res["val"]["sharpe"]),
                 float(champ_res["val"]["mdd"]),
                 float(champ_res["test"]["fitness_hard"]),
-                int(champ_res["test"]["n"]),
+                int(champ_res["test"]["trade_n"]),
                 float(champ_res["test"]["total"]),
                 float(champ_res["test"]["sharpe"]),
                 float(champ_res["test"]["mdd"]),
@@ -2066,7 +2105,7 @@ def main() -> None:
             ]
             client.write_champion(champion_header, champ_row)
 
-        signal_g, signal_res, signal_source = choose_signal_genome(champ, champ_res, best_val_g, best_val_res, cfg)
+        signal_g, _signal_res, signal_source = choose_signal_genome(champ, champ_res, best_val_g, best_val_res, cfg)
         screener = client.read_screener()
 
         if signal_g is None:
@@ -2078,7 +2117,7 @@ def main() -> None:
         rows: List[List[Any]] = []
         sid = genome_id(signal_g) if signal_g else ""
         for _, r in signals.iterrows():
-            rows.append([now_utc_iso(), sid, signal_source] + [r.get(c, "") for c in signals.columns])
+            rows.append([cycle_ts, sid, signal_source] + [r.get(c, "") for c in signals.columns])
         client.replace_signals(header, rows)
 
         log.info(
